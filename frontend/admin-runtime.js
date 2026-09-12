@@ -1167,6 +1167,16 @@ function renderMatrixMobileCards(matrixRows, months) {
     }).join("");
 }
 
+function syncAbsorptiveSiteOptions(rows) {
+    const select = dom.absorptiveSelectName;
+    if (!select) return;
+    const current = select.value;
+    const names = [...new Set((rows || []).map(row => String(row.name || '').trim()).filter(Boolean))];
+    select.innerHTML = '<option value="全部土点">全部土点 (' + names.length + '个土点总览)</option>' +
+        names.map(name => '<option value="' + escapeHtml(name) + '">' + escapeHtml(name) + '</option>').join('');
+    select.value = names.includes(current) ? current : '全部土点';
+}
+
 function renderMatrixUI(data, isFromCache = false) {
     cachedMatrixData = data;
     const summary = data.summary || {};
@@ -1180,6 +1190,7 @@ function renderMatrixUI(data, isFromCache = false) {
 
     const rawRows = data.matrix || [];
     const matrixRows = sortMatrixRowsByExpiration(rawRows);
+    syncAbsorptiveSiteOptions(matrixRows);
     const months = data.months || ["4月", "5月", "6月", "7月", "8月"];
 
     // Update Cache Snapshot Banner

@@ -953,6 +953,74 @@ def _save_sites_config(data):
     except Exception as e:
         print(f"Error saving sites config: {e}")
 
+def _normalize_expire_date(value):
+    if not value:
+        return "-"
+    text = str(value).strip().replace("-", "/")
+    match = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})", text)
+    return f"{int(match.group(1)):04d}/{int(match.group(2)):02d}/{int(match.group(3)):02d}" if match else "-"
+
+def _is_expired_site(site):
+    from datetime import date
+    expire = _normalize_expire_date(site.get("expire_date"))
+    if expire == "-":
+        return False
+    try:
+        year, month, day = (int(part) for part in expire.split("/"))
+        return date(year, month, day) < date.today()
+    except Exception:
+        return False
+
+async def _resolve_current_sites(authtoken: str):
+    """合并远端当前土点：新增自动加行，过期不进入展示。"""
+    config_data = _load_sites_config()
+    configured = config_data.get("sites", DEFAULT_ABSORPTIVE_SITES_CONFIG)
+    by_name = {str(site.get("name", "")).strip(): site for site in configured if site.get("name")}
+    try:
+        runtime_config = {}
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                runtime_config = json.load(f)
+        worksite_id = str(runtime_config.get("id", "")).strip()
+        worksite_type = str(runtime_config.get("worksitetype", "1")).strip() or "1"
+        if not worksite_id or not authtoken:
+            raise RuntimeError("missing worksite config")
+        target = f"{REMOTE_BASE_URL}/putOnRecords/unijz-unit-worksite/getWorksiteById?id={worksite_id}&worksitetype={worksite_type}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(target, headers=_remote_headers(authtoken))
+        if response.status_code != 200:
+            raise RuntimeError(f"remote status {response.status_code}")
+        payload = response.json()
+        result = payload.get("result") or payload.get("data") or {}
+        remote_sites = result.get("absorptives") or []
+        worksite = result.get("worksite") or {}
+        project_expire = _normalize_expire_date(worksite.get("cleanenddate") or worksite.get("cleanEndDate") or worksite.get("contractEndDate"))
+        merged = []
+        for remote in remote_sites:
+            if not isinstance(remote, dict) or str(remote.get("isdelete", "0")) == "1":
+                continue
+            name = str(remote.get("absorptivenamelist") or remote.get("absorptivename") or remote.get("name") or "").strip()
+            if not name:
+                continue
+            site = dict(by_name.get(name, {}))
+            site["name"] = name
+            site.setdefault("alias", [])
+            if "total_quota" not in site:
+                try:
+                    site["total_quota"] = float(remote.get("rubbishcount") or remote.get("quota") or 0)
+                except (TypeError, ValueError):
+                    site["total_quota"] = 0.0
+            if not site.get("expire_date") or site.get("expire_date") == "-":
+                site["expire_date"] = project_expire
+            merged.append(site)
+        if merged:
+            if merged != configured:
+                _save_sites_config({**config_data, "sites": merged})
+            return [site for site in merged if not _is_expired_site(site)]
+    except Exception as exc:
+        print(f"Error resolving absorptive sites: {exc}")
+    return [site for site in configured if not _is_expired_site(site)]
+
 def _load_matrix_cache():
     if os.path.exists(ABSORPTIVE_MATRIX_CACHE_FILE):
         try:
@@ -1017,7 +1085,7 @@ async def get_local_matrix_cache():
 
     cache = _load_matrix_cache()
     if cache and cache.get("matrix"):
-        sorted_matrix = _sort_matrix_by_expiration(cache.get("matrix", []))
+        sorted_matrix = _sort_matrix_by_expiration([row for row in cache.get("matrix", []) if not _is_expired_site(row)])
         return {
             "success": True,
             "has_data": True,
@@ -1030,7 +1098,7 @@ async def get_local_matrix_cache():
     
     # 暂无缓存时返回预置模版（方量为0），页面即刻成型无需白屏
     config_data = _load_sites_config()
-    sites_list = config_data.get("sites", DEFAULT_ABSORPTIVE_SITES_CONFIG)
+    sites_list = [site for site in config_data.get("sites", DEFAULT_ABSORPTIVE_SITES_CONFIG) if not _is_expired_site(site)]
     total_project_volume = float(config_data.get("total_project_volume", 938164.0))
     months = default_months
     default_rows = []
@@ -1080,7 +1148,7 @@ async def query_absorptive_matrix_stats(payload: AbsorptiveMatrixStatsRequest):
         raise HTTPException(status_code=400, detail="authtoken 授权密钥不能为空！")
         
     config_data = _load_sites_config()
-    sites_list = config_data.get("sites", DEFAULT_ABSORPTIVE_SITES_CONFIG)
+    sites_list = await _resolve_current_sites(authtoken)
     total_project_volume = float(payload.totalProjectVolume or config_data.get("total_project_volume", 938164.0))
 
     targetUrl = f"{REMOTE_BASE_URL}/constructionSite/record-waybill/pageList"
@@ -1186,7 +1254,7 @@ async def query_absorptive_matrix_stats(payload: AbsorptiveMatrixStatsRequest):
         })
 
     # 根据到期时间排序：快到期的排在前面，已过期的排在最后面
-    all_matrix_rows = _sort_matrix_by_expiration(all_matrix_rows)
+    all_matrix_rows = _sort_matrix_by_expiration([row for row in all_matrix_rows if not _is_expired_site(row)])
 
     unhandled_volume = round(max(0.0, total_project_volume - total_handled_capacity), 2)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
